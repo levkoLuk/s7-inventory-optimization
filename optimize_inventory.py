@@ -4,6 +4,286 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import norm
 import os
+import warnings
+
+warnings.filterwarnings('ignore')
+from analyze_categories import analyze_categories
+
+
+class InventoryOptimizer:
+    HOLDING_COST_RATE = 0.20
+    ORDERING_COST = 100
+    SERVICE_LEVEL_A = 0.99
+    SERVICE_LEVEL_B = 0.95
+    SERVICE_LEVEL_C = 0.90
+    Z_CLASS_VOLATILITY_MULTIPLIER = 1.5
+    COVERAGE_FACTOR_FOR_Z_CLASS = 1.5
+    MIN_ORDER_QUANTITY = 1
+    OUTPUT_DIR = "output/"
+
+    def __init__(self, category_data, product_demand_data, df_full_orders):
+        self.category_data = category_data
+        self.product_demand_data = product_demand_data
+        self.df_full_orders = df_full_orders
+        self.holding_cost_rate = self.HOLDING_COST_RATE
+        self.ordering_cost = self.ORDERING_COST
+        self.service_level_a = self.SERVICE_LEVEL_A
+        self.service_level_b = self.SERVICE_LEVEL_B
+        self.service_level_c = self.SERVICE_LEVEL_C
+        os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+
+    def get_service_level(self, abc_class):
+        if abc_class == 'A':
+            return self.service_level_a
+        elif abc_class == 'B':
+            return self.service_level_b
+        else:
+            return self.service_level_c
+
+    def get_daily_demand_stats(self, category_id):
+        cat_data = self.df_full_orders[
+            self.df_full_orders['product_category'] == category_id
+            ].copy()
+
+        if cat_data.empty:
+            return 0.0, 0.0
+
+        cat_data = cat_data.sort_values('order_date')
+        cat_data['order_date_only'] = cat_data['order_date'].dt.date
+        daily_demand = cat_data.groupby('order_date_only')['valid_delivered_qty'].sum()
+
+        if len(daily_demand) > 1:
+            mean_daily = daily_demand.mean()
+            std_daily = daily_demand.std()
+        else:
+            total_qty = cat_data['valid_delivered_qty'].sum()
+            date_range = (cat_data['order_date'].max() - cat_data['order_date'].min()).days
+            if date_range > 0:
+                mean_daily = total_qty / date_range
+                std_daily = 0.0
+            else:
+                mean_daily = total_qty / 365
+                std_daily = 0.0
+
+        mean_daily = max(0, mean_daily) if not np.isnan(mean_daily) else 0.0
+        std_daily = max(0, std_daily) if not np.isnan(std_daily) else 0.0
+
+        return mean_daily, std_daily
+
+    def calculate_eoq(self, annual_demand, ordering_cost, unit_cost, holding_cost_rate):
+        if holding_cost_rate <= 0 or unit_cost <= 0 or annual_demand <= 0:
+            return 0
+        if ordering_cost <= 0:
+            return 0
+
+        eoq = np.sqrt((2 * annual_demand * ordering_cost) / (unit_cost * holding_cost_rate))
+
+        if np.isinf(eoq) or np.isnan(eoq):
+            return 0
+
+        return eoq
+
+    def calculate_safety_stock(self, mean_daily_demand, std_daily_demand,
+                               lead_time_days, service_level):
+        if service_level >= 1.0 or service_level <= 0.0:
+            return 0
+
+        z_score = norm.ppf(service_level)
+
+        if np.isnan(std_daily_demand) or np.isinf(std_daily_demand) or std_daily_demand < 0:
+            std_daily_demand = 0
+        if np.isnan(mean_daily_demand) or np.isinf(mean_daily_demand) or mean_daily_demand < 0:
+            mean_daily_demand = 0
+
+        if isinstance(lead_time_days, pd.Series):
+            lead_time_days_val = lead_time_days.mean()
+        else:
+            lead_time_days_val = lead_time_days
+
+        if np.isnan(lead_time_days_val) or np.isinf(lead_time_days_val) or lead_time_days_val < 0:
+            lead_time_days_val = 30
+
+        lead_time_days_val = max(1, lead_time_days_val)
+
+        if mean_daily_demand == 0 and std_daily_demand == 0:
+            return 0
+
+        effective_std_dev = std_daily_demand * np.sqrt(lead_time_days_val)
+        safety_stock = z_score * effective_std_dev
+
+        return max(0, safety_stock)
+
+    def optimize_category_inventory(self, category_id):
+        cat_info = self.category_data[
+            self.category_data['product_category'] == category_id
+            ].iloc[0]
+
+        abc_class = cat_info['abc_class']
+        xyz_class = cat_info['xyz_class']
+        service_level = self.get_service_level(abc_class)
+
+        annual_demand_qty = cat_info['total_qty']
+
+        if cat_info['total_qty'] > 0:
+            avg_unit_cost = cat_info['total_amount'] / cat_info['total_qty']
+        else:
+            avg_unit_cost = 0
+
+        avg_lead_time_days = cat_info['avg_lead_time_days']
+        if pd.isna(avg_lead_time_days) or avg_lead_time_days <= 0:
+            avg_lead_time_days = 30
+
+        mean_daily_demand, std_daily_demand = self.get_daily_demand_stats(category_id)
+
+        if xyz_class == 'Z':
+            std_daily_demand *= self.Z_CLASS_VOLATILITY_MULTIPLIER
+
+        safety_stock = self.calculate_safety_stock(
+            mean_daily_demand,
+            std_daily_demand,
+            avg_lead_time_days,
+            service_level
+        )
+
+        order_quantity = self.calculate_eoq(
+            annual_demand_qty,
+            self.ordering_cost,
+            avg_unit_cost,
+            self.holding_cost_rate
+        )
+
+        if order_quantity == 0 or np.isinf(order_quantity) or order_quantity > annual_demand_qty:
+            if xyz_class == 'X':
+                order_quantity = max(self.MIN_ORDER_QUANTITY, annual_demand_qty / 12)
+            else:
+                order_quantity = (
+                                         mean_daily_demand * avg_lead_time_days * self.COVERAGE_FACTOR_FOR_Z_CLASS
+                                 ) + safety_stock
+                order_quantity = max(self.MIN_ORDER_QUANTITY, order_quantity) if annual_demand_qty > 0 else 0
+
+        order_quantity = round(order_quantity, 0)
+        safety_stock = round(safety_stock, 0)
+
+        reorder_point = (mean_daily_demand * avg_lead_time_days) + safety_stock
+        reorder_point = round(reorder_point, 0)
+
+        return {
+            'product_category': category_id,
+            'abc_class': abc_class,
+            'xyz_class': xyz_class,
+            'annual_demand_qty': round(annual_demand_qty, 2),
+            'avg_unit_cost': round(avg_unit_cost, 2),
+            'avg_lead_time_days': round(avg_lead_time_days, 2),
+            'service_level': service_level,
+            'mean_daily_demand': round(mean_daily_demand, 4),
+            'std_daily_demand_used_for_ss': round(std_daily_demand, 4),
+            'safety_stock': safety_stock,
+            'order_quantity': order_quantity,
+            'reorder_point': reorder_point
+        }
+
+    def run_optimization(self):
+        results = []
+
+        for category_id in self.category_data['product_category'].unique():
+            try:
+                result = self.optimize_category_inventory(category_id)
+                results.append(result)
+            except Exception as e:
+                print(f"Ошибка для категории {category_id}: {e}")
+                continue
+
+        return pd.DataFrame(results)
+
+    def save_optimization_results(self, optimization_results, filename='optimization_results.csv'):
+        filepath = os.path.join(self.OUTPUT_DIR, filename)
+        optimization_results.to_csv(
+            filepath,
+            index=False,
+            float_format='%.2f',
+            sep=';',
+            encoding='utf-8-sig',
+            decimal=','
+        )
+        print(f"Результаты сохранены: {filepath}")
+
+
+if __name__ == "__main__":
+    print("Запуск оптимизации...")
+
+    output_dir = "output/"
+    category_summary, product_demand = analyze_categories()
+
+    if category_summary is None:
+        print("Не удалось загрузить данные")
+        exit(1)
+
+    df_full_orders = pd.read_csv("final_orders_train.csv")
+    df_full_orders['order_date'] = pd.to_datetime(df_full_orders['order_date'], errors='coerce')
+    df_full_orders['delivery_date'] = pd.to_datetime(df_full_orders['delivery_date'], errors='coerce')
+    df_full_orders['lead_time_days'] = (
+            df_full_orders['delivery_date'] - df_full_orders['order_date']
+    ).dt.days
+    df_full_orders['valid_delivered_qty'] = df_full_orders['valid_delivered_qty'].fillna(0)
+
+    print(f"Загружено {len(df_full_orders)} записей")
+
+    optimizer = InventoryOptimizer(category_summary, product_demand, df_full_orders)
+    optimization_results = optimizer.run_optimization()
+
+    print("\nРезультаты оптимизации:")
+    print(optimization_results.to_string(index=False))
+
+    optimizer.save_optimization_results(optimization_results)
+
+    if not optimization_results.empty:
+        plt.figure(figsize=(14, 7))
+        sns.barplot(x='product_category', y='order_quantity',
+                    data=optimization_results, hue='abc_class', palette='viridis', dodge=False)
+        plt.title('Рекомендованный размер заказа')
+        plt.xlabel('Категория')
+        plt.ylabel('Объем заказа')
+        plt.legend(title='ABC Class')
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(optimizer.OUTPUT_DIR, 'recommended_order_quantity.png'), dpi=300)
+        plt.close()
+
+        plt.figure(figsize=(14, 7))
+        sns.barplot(x='product_category', y='safety_stock',
+                    data=optimization_results, hue='abc_class', palette='plasma', dodge=False)
+        plt.title('Страховой запас')
+        plt.xlabel('Категория')
+        plt.ylabel('Запас')
+        plt.legend(title='ABC Class')
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(optimizer.OUTPUT_DIR, 'recommended_safety_stock.png'), dpi=300)
+        plt.close()
+
+        plt.figure(figsize=(14, 7))
+        sns.barplot(x='product_category', y='reorder_point',
+                    data=optimization_results, hue='abc_class', palette='magma', dodge=False)
+        plt.title('Точка перезаказа')
+        plt.xlabel('Категория')
+        plt.ylabel('Точка заказа')
+        plt.legend(title='ABC Class')
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(optimizer.OUTPUT_DIR, 'recommended_reorder_point.png'), dpi=300)
+        plt.close()
+
+        print(f"Графики в папке {optimizer.OUTPUT_DIR}")
+    else:
+        print("Результаты пустые, графики не построены")
+
+"""
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import norm
+import os
 
 # Загружаем функцию анализа категорий
 from analyze_categories import analyze_categories
@@ -233,3 +513,4 @@ if __name__ == "__main__":
     plt.close()
 
     print("\nСгенерированы графики: recommended_order_quantity.png, recommended_safety_stock.png, recommended_reorder_point.png")
+    """
